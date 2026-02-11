@@ -1,0 +1,31 @@
+policy:
+  approval:
+    - or:
+      - cherry-pick auto-approval
+      - standard human review
+
+approval_rules:
+  - name: cherry-pick auto-approval
+    description: "Auto-approves low-risk cherry-pick PRs on release branches"
+    if:
+      title:
+        matches:
+          - "(?i)cherry.?pick"
+      targets_branch:
+        pattern: "^release/.*$"
+      has_labels:
+        - "cherry-pick"
+      modified_lines:
+        total: "< 200"
+      has_status:
+        conclusions: ["success"]
+        statuses:
+          - "issue-link-check"
+    # No 'requires' block: rule satisfied immediately when all 'if' predicates match
+
+  - name: standard human review
+    description: "Fallback for PRs not matching auto-approval criteria"
+    requires:
+      count: 1
+      teams:
+        - "consensys-test/release-team"
