@@ -1,0 +1,3 @@
+# Policy-bot Bridge workflows - protected by release-team
+/.github/workflows/ @consensys-test/release-team
+/policy.yml @consensys-test/release-team
