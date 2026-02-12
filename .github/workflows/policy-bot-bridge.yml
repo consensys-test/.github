@@ -1,0 +1,110 @@
+name: Policy-Bot Bridge (Auto-Approve)
+on:
+  workflow_call:
+    inputs:
+      policy-bot-context-prefix:
+        description: "Prefix of the status context to listen for"
+        type: string
+        default: 'policy-bot: '
+      policy-bot-app-login:
+        description: "Expected bot username that posts the status (anti-spoofing)"
+        type: string
+        default: 'policy-bot-v3[bot]'
+    secrets:
+      APPROVER_APP_ID:
+        required: true
+      APPROVER_APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APPROVER_APP_ID }}
+          private-key: ${{ secrets.APPROVER_APP_PRIVATE_KEY }}
+
+      - name: Resolve PR and Approve
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const sha = context.payload.sha;
+            const statusContext = context.payload.context;
+            const statusSender = context.payload.sender.login;
+            const expectedPrefix = '${{ inputs.policy-bot-context-prefix }}';
+            const trustedBot = '${{ inputs.policy-bot-app-login }}';
+
+            // 1. Security: Verify status was posted by the expected policy-bot App
+            if (statusSender !== trustedBot) {
+              core.setFailed(`Security: Status created by '${statusSender}', expected '${trustedBot}'. Possible spoofing attempt.`);
+              return;
+            }
+
+            // 2. Extract target branch from status context
+            // Policy-bot context format: "policy-bot: <branch-name>"
+            if (!statusContext.startsWith(expectedPrefix)) {
+              core.info(`Context '${statusContext}' does not match prefix '${expectedPrefix}'. Skipping.`);
+              return;
+            }
+            const targetBranch = statusContext.substring(expectedPrefix.length).trim();
+            core.info(`Processing approval for SHA ${sha}, target branch: ${targetBranch}`);
+
+            // 3. Resolve PRs from commit SHA
+            const { data: pulls } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: sha
+            });
+
+            const openPulls = pulls.filter(pr => pr.state === 'open');
+            if (openPulls.length === 0) {
+              core.warning(`No open PRs found for SHA ${sha}`);
+              return;
+            }
+
+            for (const pr of openPulls) {
+              // 4. Filter: Only approve PRs targeting the branch policy-bot evaluated
+              if (pr.base.ref !== targetBranch) {
+                core.info(`Skipping PR #${pr.number}: targets '${pr.base.ref}', policy approved '${targetBranch}'.`);
+                continue;
+              }
+
+              // 5. Verify HEAD SHA matches (race condition protection)
+              if (pr.head.sha !== sha) {
+                core.warning(`PR #${pr.number} HEAD SHA mismatch: expected ${sha}, got ${pr.head.sha}. Skipping.`);
+                continue;
+              }
+
+              // 6. Idempotency: check if already approved by this bot
+              // Prevents duplicate approvals when policy-bot re-evaluates and re-posts status
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number
+              });
+              const alreadyApproved = reviews.some(
+                r => r.state === 'APPROVED' && r.commit_id === sha
+              );
+              if (alreadyApproved) {
+                core.info(`PR #${pr.number} already has APPROVED review for SHA ${sha}. Skipping.`);
+                continue;
+              }
+
+              // 7. Submit approval
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                commit_id: sha,
+                event: 'APPROVE',
+                body: `Auto-approved by Policy-bot bridge. Rules passed for branch '${targetBranch}'.`
+              });
+
+              core.info(`Approved PR #${pr.number} (SHA: ${sha}, branch: ${targetBranch})`);
+            }
